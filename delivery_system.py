@@ -8,6 +8,8 @@ CONFIG = {
     "driver_tiers": ((5, 0.8), (10, 1.2), (None, 1.5)),
     "driver_bonus_percentage": 0.10,
     "bonus_threshold": 150.0,
+    "max_distance": 1000.0,
+    "max_order_amount": 1000000.0,
 }
 
 VALID_STATUSES = ("pending", "assigned", "picked_up", "delivered", "failed")
@@ -21,7 +23,7 @@ VALID_TRANSITIONS = (
     ("picked_up", "failed"),
 )
 TASK_FIELDS = ("id", "customer", "zone", "distance", "order_amount", "priority", "status")
-DRIVER_FIELDS = ("name", "zone", "available", "rating")
+DRIVER_FIELDS = ("name", "zone", "on_duty", "available", "rating")
 
 
 def _success(message, data=None):
@@ -49,6 +51,32 @@ def _status_of(task):
     return task["status"].strip().lower()
 
 
+def _is_plain_number_text(text):
+    """True for an optional sign, ASCII digits, and at most one decimal point.
+
+    Rejects underscores, exponents, and non-ASCII digits that float() would
+    otherwise accept or that isdigit() would treat as numeric.
+    """
+    if not text:
+        return False
+    if text[0] in "+-":
+        text = text[1:]
+    if not text:
+        return False
+    seen_dot = False
+    has_digit = False
+    for char in text:
+        if char == ".":
+            if seen_dot:
+                return False
+            seen_dot = True
+        elif char < "0" or char > "9":
+            return False
+        else:
+            has_digit = True
+    return has_digit
+
+
 def to_number(value):
     """Convert int/float/numeric string to float.
 
@@ -57,9 +85,15 @@ def to_number(value):
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return False, None
-    text = value.strip() if isinstance(value, str) else value
+    if isinstance(value, str):
+        text = value.strip()
+        if not _is_plain_number_text(text):
+            return False, None
+        to_convert = text
+    else:
+        to_convert = value
     try:
-        number = float(text)
+        number = float(to_convert)
     except (ValueError, OverflowError):
         # The ONLY try/except in the project: converting free text (or a huge
         # int) to float can fail and there is no conditional pre-check for it.
@@ -71,10 +105,10 @@ def to_number(value):
 
 def build_starter_drivers():
     return {
-        "D001": {"name": "Ali", "zone": "A", "available": True, "rating": 4.8},
-        "D002": {"name": "Ahmed", "zone": "B", "available": True, "rating": 4.5},
-        "D003": {"name": "Usman", "zone": "A", "available": False, "rating": 4.9},
-        "D004": {"name": "Hamza", "zone": "A", "available": True, "rating": 4.2},
+        "D001": {"name": "Ali", "zone": "A", "on_duty": True, "available": True, "rating": 4.8},
+        "D002": {"name": "Ahmed", "zone": "B", "on_duty": True, "available": True, "rating": 4.5},
+        "D003": {"name": "Usman", "zone": "A", "on_duty": False, "available": True, "rating": 4.9},
+        "D004": {"name": "Hamza", "zone": "A", "on_duty": True, "available": True, "rating": 4.2},
     }
 
 
@@ -105,8 +139,9 @@ def _total(values):
     """Total of already-validated numbers (thin wrapper over calculate_total)."""
     return calculate_total(*values)["data"]
 
+
 def make_rate_calculator(tiers, base):
-    
+
     def calculate(distance):
         rate = tiers[-1][1]
         for upper_limit, tier_rate in tiers:  # Local loop variables
@@ -120,7 +155,7 @@ def make_rate_calculator(tiers, base):
 
 
 def explain_legb_demo():
-    
+
     marker = "enclosing value"  # Enclosing for the inner functions below
 
     def lookup():
@@ -147,6 +182,7 @@ def explain_legb_demo():
         shadow_builtin(), len([])))
     return notes
 
+
 def _check_options(options, allowed):
     cleaned = {}
     for key in sorted(options):  # sorted -> deterministic error order
@@ -163,7 +199,7 @@ def _check_options(options, allowed):
 def calculate_delivery_charge(distance, priority, **options):
 
     ok, km = to_number(distance)
-    if not ok or km < 0:
+    if not ok or km < 0 or km > CONFIG["max_distance"]:
         return _failure("Invalid distance: {}.".format(distance))
     if not isinstance(priority, str) or priority.strip().lower() not in VALID_PRIORITIES:
         return _failure("Invalid priority: {}.".format(priority))
@@ -188,12 +224,12 @@ def calculate_delivery_charge(distance, priority, **options):
 
 
 def calculate_driver_earning(distance, order_amount, **options):
-    
+
     ok, km = to_number(distance)
-    if not ok or km < 0:
+    if not ok or km < 0 or km > CONFIG["max_distance"]:
         return _failure("Invalid distance: {}.".format(distance))
     ok, amount = to_number(order_amount)
-    if not ok or amount <= 0:
+    if not ok or amount <= 0 or amount > CONFIG["max_order_amount"]:
         return _failure("Invalid order amount: {}.".format(order_amount))
     checked = _check_options(
         options, ("driver_base", "driver_bonus_percentage", "bonus_threshold"))
@@ -215,6 +251,7 @@ def calculate_driver_earning(distance, order_amount, **options):
         "total": round(priced["subtotal"] + bonus, 2),
     })
 
+
 def validate_driver(driver):
     """Check one driver record. Returns a result (data is None)."""
     if not isinstance(driver, dict):
@@ -226,6 +263,8 @@ def validate_driver(driver):
         return _failure("Invalid driver name: {}.".format(driver["name"]))
     if not _is_text(driver["zone"]):
         return _failure("Invalid driver zone: {}.".format(driver["zone"]))
+    if not isinstance(driver["on_duty"], bool):
+        return _failure("Invalid on_duty (must be True/False): {}.".format(driver["on_duty"]))
     if not isinstance(driver["available"], bool):
         return _failure("Invalid availability (must be True/False): {}.".format(driver["available"]))
     ok, rating = to_number(driver["rating"])
@@ -247,10 +286,10 @@ def validate_task(task, known_driver_ids=None):
     if not _is_text(task["zone"]):
         return _failure("Invalid zone: {}.".format(task["zone"]))
     ok, distance = to_number(task["distance"])
-    if not ok or distance < 0:  # zero is valid
+    if not ok or distance < 0 or distance > CONFIG["max_distance"]:  # zero is valid
         return _failure("Invalid distance: {}.".format(task["distance"]))
     ok, amount = to_number(task["order_amount"])
-    if not ok or amount <= 0:
+    if not ok or amount <= 0 or amount > CONFIG["max_order_amount"]:
         return _failure("Invalid order amount: {}.".format(task["order_amount"]))
     if not isinstance(task["priority"], str) or task["priority"].strip().lower() not in VALID_PRIORITIES:
         return _failure("Invalid priority: {}.".format(task["priority"]))
@@ -284,6 +323,7 @@ def _load_context(drivers, deliveries, with_figures=False):
 
     known_ids = set(valid_drivers)
     tasks, seen_ids, rejected_tasks = [], set(), []
+    active_owner = {}
     for task in deliveries:
         check = validate_task(task, known_ids)
         task_id = task.get("id") if isinstance(task, dict) else None
@@ -291,8 +331,16 @@ def _load_context(drivers, deliveries, with_figures=False):
             rejected_tasks.append({"task_id": task_id, "reason": check["message"]})
         elif task_id in seen_ids:
             rejected_tasks.append({"task_id": task_id, "reason": "Duplicate task ID: {}.".format(task_id)})
+        elif _status_of(task) in ACTIVE_STATUSES and task.get("driver_id") in active_owner:
+            owner = task["driver_id"]
+            rejected_tasks.append({
+                "task_id": task_id,
+                "reason": "Driver {} already has active task {}.".format(owner, active_owner[owner]),
+            })
         else:
             seen_ids.add(task_id)
+            if _status_of(task) in ACTIVE_STATUSES:
+                active_owner[task["driver_id"]] = task_id
             tasks.append(task)
 
     figures = {}
@@ -341,10 +389,15 @@ def _terminal_message(task_id, status):
     return "Task {} has already failed.".format(task_id)
 
 
+def _is_free_driver(driver, driver_id, busy_driver_ids):
+    """On duty and not holding an active task. Busy is derived from tasks."""
+    return driver["on_duty"] and driver_id not in busy_driver_ids
+
+
 def get_eligible_drivers(drivers, zone, busy_driver_ids=()):
     wanted = zone.strip().upper()
     return [driver_id for driver_id, driver in drivers.items()
-            if driver["available"] and driver_id not in busy_driver_ids
+            if _is_free_driver(driver, driver_id, busy_driver_ids)
             and _zone_of(driver) == wanted]
 
 
@@ -373,7 +426,7 @@ def _assign(task, driver, driver_id):
 
 
 def assign_driver(drivers, deliveries, task_id, driver_id):
-    
+
     loaded = _load_context(drivers, deliveries)
     if not loaded["success"]:
         return loaded
@@ -387,7 +440,9 @@ def assign_driver(drivers, deliveries, task_id, driver_id):
     driver = _lookup(context["drivers"], driver_id)
     if driver is None:
         return _failure(_driver_missing_message(context, driver_id))
-    if not driver["available"] or driver_id in context["busy_driver_ids"]:
+    if not driver["on_duty"]:
+        return _failure("Driver {} is not on duty.".format(driver_id))
+    if driver_id in context["busy_driver_ids"]:
         return _failure("Driver {} is currently busy.".format(driver_id))
     if _zone_of(driver) != _zone_of(task):
         return _failure("Driver {} is in zone {}, but task {} requires zone {}.".format(
@@ -416,7 +471,7 @@ def allocate_driver(drivers, deliveries, task_id):
 
 def _build_driver_queues(drivers, busy_driver_ids):
     candidates = [(driver_id, driver) for driver_id, driver in drivers.items()
-                  if driver["available"] and driver_id not in busy_driver_ids]
+                  if _is_free_driver(driver, driver_id, busy_driver_ids)]
     worst_first = sorted(candidates,
                          key=lambda item: (-float(item[1]["rating"]), item[0]),
                          reverse=True)
@@ -453,6 +508,7 @@ def allocate_pending_tasks(drivers, deliveries):
          "rejected_tasks": context["rejected_tasks"],
          "rejected_drivers": context["rejected_drivers"]})
 
+
 def update_delivery_status(drivers, deliveries, task_id, new_status):
     """Move a task along assigned -> picked_up -> delivered/failed.
 
@@ -483,6 +539,7 @@ def update_delivery_status(drivers, deliveries, task_id, new_status):
     if new in TERMINAL_STATUSES:
         driver = _lookup(context["drivers"], task.get("driver_id"))
         if driver is not None:
+            # Free the job slot; on_duty is a roster flag and is never flipped here.
             driver["available"] = True
             released = task["driver_id"]
     return _success("Task {} moved from {} to {}.".format(task["id"], old, new),
@@ -571,7 +628,7 @@ def _build_report_stats(context):
 def _unassigned_tasks(context):
     """Pending tasks without a driver, each with the reason it is waiting."""
     free_zones = {_zone_of(driver) for driver_id, driver in context["drivers"].items()
-                  if driver["available"] and driver_id not in context["busy_driver_ids"]}
+                  if _is_free_driver(driver, driver_id, context["busy_driver_ids"])}
     waiting = sorted((task for task in context["tasks"]
                       if _status_of(task) == "pending" and task.get("driver_id") is None),
                      key=lambda task: task["id"])
@@ -627,10 +684,10 @@ def additional_reports(drivers, deliveries):
                              if longest else None),
         "highest_value_order": ({"task_id": highest["id"], "order_amount": float(highest["order_amount"])}
                                 if highest else None),
-        "available_drivers": sorted(driver_id for driver_id, driver in context["drivers"].items()
-                                    if driver["available"]),
-        "busy_drivers": sorted(driver_id for driver_id, driver in context["drivers"].items()
-                               if not driver["available"]),
+        "available_drivers": sorted(
+            driver_id for driver_id, driver in context["drivers"].items()
+            if _is_free_driver(driver, driver_id, context["busy_driver_ids"])),
+        "busy_drivers": sorted(context["busy_driver_ids"]),
         "urgent_deliveries": sorted(task["id"] for task in tasks if _priority_of(task) == "urgent"),
         "unassigned_tasks": _unassigned_tasks(context),
         "rejected_tasks": context["rejected_tasks"],
@@ -671,6 +728,7 @@ def dashboard_data(drivers, deliveries):
         "rejected_tasks": context["rejected_tasks"],
         "rejected_drivers": context["rejected_drivers"],
     })
+
 
 def format_money(amount):
     return "{}{:.2f}".format(CONFIG["currency"], amount)

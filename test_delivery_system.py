@@ -18,8 +18,8 @@ def make_task(task_id="T1", **changes):
     return task
 
 
-def make_driver(zone="A", rating=4.5, available=True, name="Test"):
-    return {"name": name, "zone": zone, "available": available, "rating": rating}
+def make_driver(zone="A", rating=4.5, available=True, on_duty=True, name="Test"):
+    return {"name": name, "zone": zone, "on_duty": on_duty, "available": available, "rating": rating}
 
 
 def demo_state():
@@ -33,10 +33,12 @@ def demo_state():
     tasks.append(make_task("TASK004", zone="C", distance=0, order_amount=50))
     return drivers, tasks
 
+
 def test_fresh_starter_data():
     first, second = build_starter_drivers(), build_starter_drivers()
     first["D001"]["available"] = False
     assert second["D001"]["available"] is True
+    assert second["D003"]["on_duty"] is False and second["D003"]["available"] is True
     one, two = build_starter_deliveries(), build_starter_deliveries()
     one[0]["driver_id"] = "D001"
     assert two[0]["driver_id"] is None
@@ -52,10 +54,10 @@ def test_allocation_picks_highest_rating():
 
 def test_allocation_respects_zone_and_availability():
     drivers, tasks = starter()
-    # D003 has the best rating (4.9) in zone A but is unavailable; D002 is zone B.
+    # D003 has the best rating (4.9) in zone A but is off duty; D002 is zone B.
     assert allocate_driver(drivers, tasks, "TASK003")["data"]["driver_id"] == "D001"
     assert allocate_driver(drivers, tasks, "TASK002")["data"]["driver_id"] == "D002"
-    assert drivers["D003"]["available"] is False
+    assert drivers["D003"]["on_duty"] is False and drivers["D003"]["available"] is True
 
 
 def test_tie_break_lowest_driver_id():
@@ -90,8 +92,8 @@ def test_already_assigned_task_rejected():
 
 def test_busy_driver_rejected():
     drivers, tasks = starter()
-    outcome = assign_driver(drivers, tasks, "TASK001", "D003")  # flagged unavailable
-    assert outcome["message"] == "Driver D003 is currently busy."
+    outcome = assign_driver(drivers, tasks, "TASK001", "D003")  # off duty, not on a job
+    assert outcome["message"] == "Driver D003 is not on duty."
     assert assign_driver(drivers, tasks, "TASK001", "D001")["success"]
     outcome = assign_driver(drivers, tasks, "TASK003", "D001")  # now busy with TASK001
     assert outcome["message"] == "Driver D001 is currently busy."
@@ -146,6 +148,7 @@ def test_single_active_task_rule():
     assert allocate_driver(drivers, tasks, "T2")["success"] is False
     assert assign_driver(drivers, tasks, "T2", "D001")["message"] == "Driver D001 is currently busy."
 
+
 def test_delivery_charge_boundaries():
     expected = {0: 5.0, 4: 9.0, 5: 10.0, 5.5: 13.25, 6: 14.0, 7: 15.5, 10: 20.0, 11: 27.0, 12: 29.0}
     for km, final in expected.items():
@@ -181,6 +184,7 @@ def test_delivery_charge_invalid_input():
         assert calculate_delivery_charge(bad, "normal")["success"] is False, bad
     assert calculate_delivery_charge(3, "super_urgent")["message"] == "Invalid priority: super_urgent."
     assert calculate_delivery_charge(3, None)["success"] is False
+
 
 def test_driver_earning_distance_brackets():
     expected = {0: 3.0, 4: 6.2, 5: 7.0, 6: 10.2, 10: 15.0, 11: 19.5}
@@ -264,6 +268,7 @@ def test_validate_driver():
         assert validate_driver(make_driver(rating=bad))["success"] is False, bad
     for bad in ("yes", 1, 0, None):
         assert validate_driver(make_driver(available=bad))["success"] is False, bad
+        assert validate_driver(make_driver(on_duty=bad))["success"] is False, bad
     assert validate_driver(make_driver(zone=""))["success"] is False
     assert validate_driver(make_driver(name=" "))["success"] is False
     assert validate_driver({"name": "x"})["message"] == "Missing driver field: zone."
@@ -304,6 +309,58 @@ def test_numeric_string_tasks_work_end_to_end():
     update_delivery_status(drivers, tasks, "T1", "delivered")
     board = dashboard_data(drivers, tasks)["data"]
     assert board["total_delivery_charges"] == 9.0 and board["total_order_value"] == 120.0
+
+
+def test_realistic_upper_limits_prevent_dashboard_crash():
+    assert calculate_delivery_charge(1000, "normal")["data"]["final_charge"] == 2005.0
+    assert calculate_delivery_charge(1000.01, "normal")["success"] is False
+    assert calculate_driver_earning(1000, 100)["success"]
+    assert calculate_driver_earning(1, 1000000)["success"]
+    assert calculate_driver_earning(1, 1000000.01)["success"] is False
+    assert validate_task(make_task(distance=1e308))["success"] is False
+    assert validate_task(make_task(order_amount=1e308))["success"] is False
+    drivers = {"D001": make_driver()}
+    tasks = [make_task(distance=1e308, status="delivered", driver_id="D001"),
+             make_task("T2", order_amount=1e308, status="delivered", driver_id="D001")]
+    board = dashboard_data(drivers, tasks)
+    assert board["success"] and board["data"]["total_tasks"] == 0
+    assert board["data"]["total_delivery_charges"] == 0.0
+    assert "Total Delivery Charges: $0.00" in render_dashboard(board["data"])
+
+
+def test_odd_numeric_strings_are_rejected():
+    for bad in ("1_000", "4e2", "4E2", "١٢٣"):
+        assert validate_task(make_task(distance=bad))["success"] is False, bad
+        assert calculate_delivery_charge(bad, "normal")["success"] is False, bad
+    assert validate_task(make_task(distance="4.50", order_amount="99"))["success"]
+
+
+def test_second_active_task_for_same_driver_is_rejected():
+    drivers = {"D001": make_driver()}
+    tasks = [make_task("T1", status="assigned", driver_id="D001"),
+             make_task("T2", status="picked_up", driver_id="D001"),
+             make_task("T3")]
+    board = dashboard_data(drivers, tasks)["data"]
+    assert board["total_tasks"] == 2
+    assert board["rejected_tasks"][0]["task_id"] == "T2"
+    assert board["rejected_tasks"][0]["reason"] == "Driver D001 already has active task T1."
+    assert allocate_driver(drivers, tasks, "T3")["success"] is False
+
+
+def test_off_duty_is_separate_from_busy():
+    drivers = {"D003": make_driver(on_duty=False, rating=4.9, name="Usman"),
+               "D001": make_driver(rating=4.0, name="Ali")}
+    tasks = [make_task("T1", status="assigned", driver_id="D003"), make_task("T2")]
+    extra = additional_reports(drivers, tasks)["data"]
+    assert extra["busy_drivers"] == ["D003"]
+    assert extra["available_drivers"] == ["D001"]
+    update_delivery_status(drivers, tasks, "T1", "picked_up")
+    update_delivery_status(drivers, tasks, "T1", "delivered")
+    assert drivers["D003"]["on_duty"] is False and drivers["D003"]["available"] is True
+    assert allocate_driver(drivers, tasks, "T2")["data"]["driver_id"] == "D001"
+    extra = additional_reports(drivers, tasks)["data"]
+    assert extra["available_drivers"] == []
+    assert extra["busy_drivers"] == ["D001"]
 
 
 # --------------------------------------------------------------------------
@@ -353,7 +410,7 @@ def test_every_invalid_transition_is_rejected_and_changes_nothing():
 
 def test_delivered_and_failed_tasks_cannot_be_reprocessed():
     drivers, tasks = starter()
-    for task_id, final, text in (("TASK001", "delivered", "delivered"), ("TASK003", "failed", "failed")):
+    for task_id, final in (("TASK001", "delivered"), ("TASK003", "failed")):
         assign_driver(drivers, tasks, task_id, "D001")
         update_delivery_status(drivers, tasks, task_id, "picked_up")
         update_delivery_status(drivers, tasks, task_id, final)
@@ -383,6 +440,7 @@ def test_failed_operations_do_not_mutate_data():
     update_delivery_status(drivers, tasks, "TASK001", "delivered")
     calculate_delivery_charge(-1, "normal")
     assert drivers == build_starter_drivers() and tasks == build_starter_deliveries()
+
 
 def test_driver_report_totals_zero_task_driver_and_completion():
     drivers = {"D001": make_driver(name="One"), "D002": make_driver(zone="B", name="Two")}
@@ -421,7 +479,7 @@ def test_additional_reports():
     assert data["longest_delivery"] == {"task_id": "TASK002", "distance": 12.0}
     assert data["highest_value_order"] == {"task_id": "TASK003", "order_amount": 200.0}
     assert data["available_drivers"] == ["D001", "D004"]
-    assert data["busy_drivers"] == ["D002", "D003"]
+    assert data["busy_drivers"] == ["D002"]
     assert data["urgent_deliveries"] == ["TASK002"]
     assert data["unassigned_tasks"] == [{"task_id": "TASK004",
                                          "reason": "No available driver exists in zone C."}]
@@ -488,6 +546,7 @@ def test_reports_share_one_ranking_and_set_based_zones():
     assert zones[-1]["driver_count"] == 0 and zones[-1]["total_tasks"] == 1   # task-only zone C
     assert dashboard_data(drivers, tasks)["data"]["highest_revenue_zone"] == zones[0]["zone"]
 
+
 def test_empty_drivers_and_empty_deliveries():
     drivers, tasks = starter()
     assert allocate_driver({}, tasks, "TASK001")["message"] == "No available driver exists in zone A."
@@ -530,6 +589,7 @@ def test_wrong_container_types_never_crash():
         assert dashboard_data(drivers, bad)["success"] is False
         assert allocate_driver(drivers, bad, "TASK001")["success"] is False
 
+
 def test_closure_remembers_enclosing_values():
     cheap = make_rate_calculator(((5, 1.0), (None, 2.0)), 10)
     pricey = make_rate_calculator(((5, 3.0), (None, 4.0)), 0)
@@ -567,6 +627,9 @@ def run_tests():
         except AssertionError as error:
             failures.append(test.__name__)
             print("FAIL: {} (assertion failed: {!r})".format(test.__name__, error))
+        except Exception as error:
+            failures.append(test.__name__)
+            print("ERROR: {} ({})".format(test.__name__, error))
     print("\n{}/{} tests passed.".format(len(tests) - len(failures), len(tests)))
     if failures:
         print("Failed: " + ", ".join(failures))

@@ -15,6 +15,7 @@ No classes, no files or databases, no frameworks, no third-party packages, no im
 | `delivery_system.py` | All business logic, report/render functions and a `main()` demo |
 | `test_delivery_system.py` | Assert-based tests with a small PASS/FAIL runner |
 | `README.md` | This document |
+| `.gitignore` | Ignores `__pycache__/`, `*.pyc`, `.venv/` and `.idea/` |
 
 ## How to run
 
@@ -49,7 +50,7 @@ Every public operation receives `drivers` (dict keyed by driver ID) and `deliver
 
 ## Data structures
 
-- **Drivers**: dict `driver_id -> {"name", "zone", "available", "rating"}`.
+- **Drivers**: dict `driver_id -> {"name", "zone", "on_duty", "available", "rating"}`. `on_duty` is the roster flag (Usman/D003 starts off duty). `available` means "not currently holding a job" and is flipped only by assignment and completion. Busy is always derived from active tasks.
 - **Deliveries**: list of dicts `{"id", "customer", "zone", "distance", "order_amount", "priority", "status", "driver_id"}`. `driver_id` is optional on input and treated as `None` when missing.
 - **Tuples** hold fixed data: status lists, valid transitions, rate tiers.
 - **Sets** hold unique zones, seen task IDs, known driver IDs, busy driver IDs and zones with a free driver.
@@ -61,15 +62,16 @@ Every public operation receives `drivers` (dict keyed by driver ID) and `deliver
 |---|---|
 | Task `id`, `customer` | non-empty text |
 | `zone` | non-empty text; compared after `strip().upper()` |
-| `distance` | int, float or numeric string; **0 is valid**; negative, bool, NaN, infinity and non-numeric text are rejected |
-| `order_amount` | same formats, but must be **greater than 0** |
+| `distance` | int, float or plain decimal string (`"4.5"`); **0 is valid**; must be **≤ 1,000 km**. Negative, bool, NaN, infinity, exponents (`"4e2"`), underscores (`"1_000"`), non-ASCII digits and non-numeric text are rejected |
+| `order_amount` | same formats, but must be **greater than 0** and **≤ 1,000,000** |
 | `priority` | `normal` or `urgent` after `strip().lower()` |
 | `status` | `pending`, `assigned`, `picked_up`, `delivered`, `failed` |
 | Active task (`assigned`/`picked_up`) | must have a `driver_id` of a known, valid driver |
-| Driver `available` | strictly `True` or `False` |
+| Driver `on_duty` | strictly `True` or `False`; never changed by assignment or delivery |
+| Driver `available` | strictly `True` or `False`; set `False` on assignment and `True` when the job ends |
 | Driver `rating` | number from 0 to 5 inclusive |
 
-Invalid or duplicate records are skipped and listed in `rejected_tasks` / `rejected_drivers` of the result. They never stop valid records from being processed. The first valid occurrence of a task ID is used; later duplicates are rejected. Operations that name a rejected task or driver say why, e.g. `Task TASK001 has invalid data: Invalid distance: -3.`
+Invalid or duplicate records are skipped and listed in `rejected_tasks` / `rejected_drivers` of the result. They never stop valid records from being processed. The first valid occurrence of a task ID is used; later duplicates are rejected. A driver may hold at most one `assigned`/`picked_up` task in the input; a second active task for the same driver is skipped with a reason. Operations that name a rejected task or driver say why, e.g. `Task TASK001 has invalid data: Invalid distance: -3.`
 
 ## Pricing
 
@@ -97,15 +99,15 @@ Calculations use unrounded values; each returned amount is rounded to 2 decimals
 
 ## Driver allocation
 
-A driver is eligible when the driver record is valid, `available` is `True`, the driver has no active task, and the zone matches the task zone. A task can be allocated only while it is `pending` with no `driver_id`.
+A driver is eligible when the driver record is valid, `on_duty` is `True`, the driver has no active (`assigned`/`picked_up`) task, and the zone matches the task zone. A task can be allocated only while it is `pending` with no `driver_id`.
 
 - **Selection**: highest rating wins.
 - **Tie-break**: equal ratings choose the lexicographically smallest driver ID (`D001` beats `D004`). Implemented once in `pick_best_driver` with `min(..., key=lambda ...)` on `(-rating, driver_id)`.
-- **On success**: `driver["available"] = False`, `task["driver_id"] = id`, `task["status"] = "assigned"` (single place: `_assign`).
-- **On failure**: nothing changes and the message explains why, e.g. `No available driver exists in zone C.`
+- **On success**: `driver["available"] = False`, `task["driver_id"] = id`, `task["status"] = "assigned"` (single place: `_assign`). `on_duty` is not changed.
+- **On failure**: nothing changes and the message explains why, e.g. `No available driver exists in zone C.` Off-duty drivers are rejected with `Driver D003 is not on duty.`
 - **Batch** (`allocate_pending_tasks`): urgent tasks first, then by task ID. Drivers are ranked once per zone, so the cost is O(T log T + D log D). The result is identical to calling `allocate_driver` repeatedly in that order (covered by a test).
-- **Direct** (`assign_driver`): rejects unknown task/driver, delivered/failed/already-assigned tasks, busy drivers and drivers from another zone.
-- A driver holds at most one active task. A driver whose flag says available but who still has an `assigned`/`picked_up` task is treated as busy.
+- **Direct** (`assign_driver`): rejects unknown task/driver, delivered/failed/already-assigned tasks, off-duty drivers, busy drivers and drivers from another zone.
+- A driver holds at most one active task. Busy is computed from those tasks (`busy_driver_ids`), not from `available`. An off-duty driver who finishes an input-assigned job stays off duty and is not put back in the pool.
 
 ## Status workflow
 
@@ -117,7 +119,7 @@ pending -> assigned -> picked_up -> delivered
 
 Valid transitions are only `assigned -> picked_up`, `picked_up -> delivered` and `picked_up -> failed`. `pending -> assigned` happens only through `assign_driver` / `allocate_driver`; `update_delivery_status` refuses it and says so. Everything else is rejected, including same-status updates, backward moves and any move out of `delivered` or `failed` (`Task TASK001 has already been delivered.`).
 
-When a task becomes `delivered` or `failed`, its driver becomes available again. Never earlier.
+When a task becomes `delivered` or `failed`, that driver's `available` flag is set back to `True` (the job slot is free). `on_duty` is never flipped, so an off-duty driver is not treated as free for the next allocation. Drivers are never released earlier than delivered/failed.
 
 ## Reports and dashboard
 
@@ -130,7 +132,7 @@ All report numbers come from `_build_report_stats`, which aggregates drivers and
 
 **Zone report**: zones come from a set built from driver zones and task zones. Each row has task count, delivered count, driver count and delivered delivery-charge revenue.
 
-**Additional reports** (`additional_reports`): unique zones, tasks per zone, revenue per zone, average order amount, longest delivery, highest-value order, available drivers, busy drivers (flag is `False`), urgent deliveries, and unassigned tasks with a reason. Ties for longest delivery and highest-value order choose the lexicographically smallest task ID.
+**Additional reports** (`additional_reports`): unique zones, tasks per zone, revenue per zone, average order amount, longest delivery, highest-value order, available drivers (`on_duty` and not on an active task), busy drivers (IDs in `busy_driver_ids`), urgent deliveries, and unassigned tasks with a reason. Off-duty drivers with no active task appear in neither list. Ties for longest delivery and highest-value order choose the lexicographically smallest task ID.
 
 **Dashboard definitions** (these metrics are project decisions, not part of the original assignment text):
 
@@ -180,7 +182,7 @@ Task TASK001 has already been delivered.
 Unknown pricing option: bogus.
 ```
 
-Wrong container types (`None` instead of a dict or list, unhashable IDs) are rejected with a message too. The only `try`/`except` in the implementation is in `to_number`, catching `ValueError` and `OverflowError` when converting text or a huge int to `float`. (The test runner also catches `AssertionError` so it can print PASS/FAIL for every test.)
+Wrong container types (`None` instead of a dict or list, unhashable IDs) are rejected with a message too. The only `try`/`except` in the implementation is in `to_number`, catching `ValueError` and `OverflowError` when converting text or a huge int to `float`. The test runner catches `AssertionError` (FAIL) and any other `Exception` (ERROR) so one broken test cannot stop the rest of the run.
 
 ## Edge cases and the tests that cover them
 
@@ -188,12 +190,16 @@ Wrong container types (`None` instead of a dict or list, unhashable IDs) are rej
 |---|---|
 | Invalid driver ID / invalid task ID | `test_assign_driver_rejections`, `test_invalid_task_is_reported_by_id` |
 | Zero distance | `test_delivery_charge_boundaries`, `test_driver_earning_distance_brackets` |
+| Distance / order amount above the realistic cap | `test_realistic_upper_limits_prevent_dashboard_crash` |
+| Odd numeric strings (`1_000`, `4e2`) | `test_odd_numeric_strings_are_rejected` |
 | Negative distance | `test_delivery_charge_invalid_input`, `test_validate_task_rejections` |
 | Invalid order amount | `test_driver_earning_kwargs_and_invalid_input`, `test_validate_task_rejections` |
 | Invalid priority / status | `test_delivery_charge_invalid_input`, `test_update_status_invalid_input` |
 | No driver in zone | `test_no_driver_in_zone` |
 | Already-assigned task | `test_already_assigned_task_rejected` |
 | Busy driver | `test_busy_driver_rejected`, `test_single_active_task_rule` |
+| Off duty vs busy | `test_off_duty_is_separate_from_busy` |
+| Two active tasks for one driver | `test_second_active_task_for_same_driver_is_rejected` |
 | Equal ratings | `test_tie_break_lowest_driver_id`, `test_top_driver_tie_breaks` |
 | Invalid transition | `test_every_invalid_transition_is_rejected_and_changes_nothing` |
 | Delivered / failed task processed again | `test_delivered_and_failed_tasks_cannot_be_reprocessed` |
@@ -242,8 +248,12 @@ PASS: test_invalid_task_is_reported_by_id
 PASS: test_legb_demo_covers_all_four_scopes
 PASS: test_no_driver_in_zone
 PASS: test_numeric_string_tasks_work_end_to_end
+PASS: test_odd_numeric_strings_are_rejected
+PASS: test_off_duty_is_separate_from_busy
+PASS: test_realistic_upper_limits_prevent_dashboard_crash
 PASS: test_reports_on_completely_empty_data
 PASS: test_reports_share_one_ranking_and_set_based_zones
+PASS: test_second_active_task_for_same_driver_is_rejected
 PASS: test_single_active_task_rule
 PASS: test_tie_break_lowest_driver_id
 PASS: test_top_driver_tie_breaks
@@ -256,7 +266,7 @@ PASS: test_validate_task_rejections
 PASS: test_wrong_container_types_never_crash
 PASS: test_zone_report_multiple_zones_ranked_by_revenue
 
-48/48 tests passed.
+52/52 tests passed.
 All tests passed.
 ```
 
@@ -319,7 +329,7 @@ Average order amount: $112.50
 Longest delivery: TASK002 (12.00 km)
 Highest-value order: TASK003 ($200.00)
 Available drivers: D001, D004
-Busy drivers: D002, D003
+Busy drivers: D002
 Urgent deliveries: TASK002
 Tasks that could not be assigned:
 - TASK004: No available driver exists in zone C.
@@ -355,8 +365,10 @@ Shadowing: inside shadow_builtin, len = 'a local string'; outside, len([]) is 0.
 
 These details were not fixed by the assignment text; the project chose them and keeps them consistent:
 
-- Flat-bracket pricing (not progressive slabs).
+- Flat-bracket pricing (not progressive slabs). Boundaries jump: 5 km is $10.00, 5.01 km uses the next rate.
 - Zero distance is valid; order amount must be greater than 0.
+- Distance is capped at 1,000 km and order amount at 1,000,000 so pricing cannot overflow to `inf` and crash the dashboard.
+- `on_duty` is roster; `available` is "not on a job"; busy is derived from active tasks.
 - Equal ratings: lowest driver ID. Batch order: urgent first, then task ID.
 - Driver distance, earnings and zone revenue count delivered tasks only; failed tasks earn $0.
 - Top Driver, Highest Revenue Zone and the other dashboard definitions above.
@@ -364,6 +376,7 @@ These details were not fixed by the assignment text; the project chose them and 
 - Task and driver IDs are matched exactly (case-sensitive); zones are normalised to upper case only for comparison.
 - A pending task that already carries a `driver_id` is neither allocatable nor listed as unassigned.
 - `calculate_total` rejects negative values, so it cannot total refunds or discounts.
+- Numeric strings must be a plain decimal (optional sign, ASCII digits, at most one `.`).
 
 ## Limitations
 
@@ -371,4 +384,7 @@ These details were not fixed by the assignment text; the project chose them and 
 - Every public call validates all drivers and tasks again (O(T + D)), which is fine for this scale but not a persistent index.
 - Money uses floats rounded to 2 decimals, not exact decimals.
 - Performance numbers (about 0.25 s to batch-allocate 50,000 tasks on the machine used during development) were measured once and are not guaranteed.
+<<<<<<< HEAD
 >>>>>>> 8a9a3a9 (delivery and driver management system)
+=======
+>>>>>>> 5671b99 (Dashboard crash issue has been solved and the README.md file is rewritten with correction)
