@@ -298,11 +298,12 @@ def validate_task(task, known_driver_ids=None):
     driver_id = task.get("driver_id")
     if driver_id is not None and not _is_text(driver_id):
         return _failure("Invalid driver_id: {}.".format(driver_id))
-    if _status_of(task) in ACTIVE_STATUSES:
+    status = _status_of(task)
+    if status in ACTIVE_STATUSES or status == "delivered":
         if driver_id is None:
-            return _failure("Active task {} has no driver_id.".format(task["id"]))
+            return _failure("Task {} ({}) has no driver_id.".format(task["id"], status))
         if known_driver_ids is not None and driver_id not in known_driver_ids:
-            return _failure("Active task {} references unknown driver {}.".format(task["id"], driver_id))
+            return _failure("Task {} ({}) references unknown driver {}.".format(task["id"], status, driver_id))
     return _success("Task is valid.")
 
 

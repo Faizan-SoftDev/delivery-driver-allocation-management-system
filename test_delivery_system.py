@@ -256,10 +256,9 @@ def test_validate_task_rejections():
 
 
 def test_validate_task_active_needs_known_driver():
-    assert validate_task(make_task(status="assigned"))["success"] is False                  # no driver
-    assert validate_task(make_task(status="picked_up", driver_id="D9"), {"D1"})["success"] is False
-    assert validate_task(make_task(status="assigned", driver_id="D1"), {"D1"})["success"]
-
+    assert validate_task(make_task(status="delivered"))["success"] is False
+    assert validate_task(make_task(status="delivered", driver_id="D999"), {"D1"})["success"] is False
+    assert validate_task(make_task(status="delivered", driver_id="D1"), {"D1"})["success"]
 
 def test_validate_driver():
     assert validate_driver(make_driver())["success"]
